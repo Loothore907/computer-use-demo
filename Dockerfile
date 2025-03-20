@@ -3,7 +3,7 @@ FROM python:3.10-slim
 # Set environment variable for better Docker logs
 ENV PYTHONUNBUFFERED=1 
 
-# Install basic utilities
+# Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     gnupg \
@@ -11,54 +11,49 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     vim \
     ca-certificates \
     wget \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install Chrome and Xvfb for Selenium
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    chromium \
-    chromium-driver \
     xvfb \
+    xdotool \
+    scrot \
+    gnome-screenshot \
+    imagemagick \
+    firefox-esr \
+    dbus-x11 \
+    x11-utils \
     && rm -rf /var/lib/apt/lists/*
 
-# Set environment variables for Chrome and Selenium
-ENV CHROME_BIN=/usr/bin/chromium
-ENV CHROMEDRIVER_PATH=/usr/bin/chromedriver
-ENV DISPLAY=:99
+# Set up X11 virtual display
+ENV DISPLAY=:1
+ENV WIDTH=1366
+ENV HEIGHT=768
+ENV DEPTH=24
+ENV DISPLAY_NUM=1
 
-# Set up Selenium
-RUN pip install --no-cache-dir webdriver-manager
-
-# Set working directory
+# Install Python dependencies
 WORKDIR /app
-
-# Copy only requirements first for better caching
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Create log directory
-RUN mkdir -p /var/log/claude-agent
-
 # Copy source code
-COPY loop.py .
 COPY tools/ ./tools/
-COPY app.py .
-COPY container_entry.py .
-
-# Copy Streamlit configuration to disable welcome screen
+COPY loop.py app.py container_entry.py run.py ./
 COPY .streamlit/ /root/.streamlit/
 
-# Create a debug script
-RUN echo "#!/bin/bash\nls -la /app\nls -la /app/tools\ncat /app/tools/__init__.py\necho 'Python version:'\npython --version\necho 'Done!'" > /app/debug.sh && chmod +x /app/debug.sh
+# Create directories
+RUN mkdir -p /tmp/outputs /app/workspace /app/data /var/log/claude-agent
 
-# Create app user
+# Create X11 startup script
+RUN echo '#!/bin/bash\nXvfb :1 -screen 0 ${WIDTH}x${HEIGHT}x${DEPTH} &\nsleep 2\nexport DISPLAY=:1\nexec "$@"' > /app/start-xvfb.sh && \
+    chmod +x /app/start-xvfb.sh
+
+# Container startup script
+RUN echo '#!/bin/bash\n/app/start-xvfb.sh python /app/container_entry.py' > /app/start.sh && \
+    chmod +x /app/start.sh
+
+# Create user
 RUN useradd -m appuser
-RUN chown -R appuser:appuser /app /var/log/claude-agent
+RUN chown -R appuser:appuser /app /var/log/claude-agent /tmp/outputs
 
-# Create dirs for mounting
-RUN mkdir -p /app/workspace /app/data
-RUN chown -R appuser:appuser /app/workspace /app/data
-
-# Switch to non-root user
+# Switch to non-root user for better security
 USER appuser
 
 # Add a healthcheck
@@ -66,4 +61,4 @@ HEALTHCHECK --interval=5s --timeout=3s --retries=3 \
   CMD python -c "import os, sys; sys.exit(0 if os.path.exists('/app/loop.py') else 1)"
 
 # Default command
-CMD ["python", "container_entry.py"]
+ENTRYPOINT ["/app/start.sh"]

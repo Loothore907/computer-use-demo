@@ -1,13 +1,28 @@
 """
-This module contains tools for the computer use demo.
+Tools for Anthropic's computer use API.
+
+This package provides tools for interacting with a computer,
+allowing Claude to control the screen, keyboard, and mouse.
 """
 
-from tools.base import Tool
-from tools.bash import BashTool
-from tools.browser import BrowserTool
-from tools.computer import ComputerTool
-from tools.docker import DockerTool
-from tools.edit import EditTool
-from tools.search import SearchTool
+from .base_anthropic import BaseAnthropicTool, ToolCollection, ToolError, ToolResult
+from .computer import ComputerTool20241022, ComputerTool20250124
+from .run import run, run_with_timeout, run_bash
+from .tool_groups import TOOL_GROUPS_BY_VERSION, ToolGroup, ToolVersion, get_tool_group, get_default_tool_group
 
-__all__ = ["Tool", "BashTool", "BrowserTool", "ComputerTool", "DockerTool", "EditTool", "SearchTool"] 
+__all__ = [
+    "BaseAnthropicTool",
+    "ToolCollection",
+    "ToolError",
+    "ToolResult",
+    "ComputerTool20241022",
+    "ComputerTool20250124",
+    "run",
+    "run_with_timeout",
+    "run_bash",
+    "TOOL_GROUPS_BY_VERSION",
+    "ToolGroup",
+    "ToolVersion",
+    "get_tool_group",
+    "get_default_tool_group",
+]
