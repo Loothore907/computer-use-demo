@@ -8,13 +8,120 @@ import logging
 import traceback
 import base64
 import datetime
-from typing import Any, Dict, List, Optional
-import inspect
+import requests
+from typing import Any, Dict, List, Optional, Tuple
+
+# We'll use requests directly instead of the SDK
+# import anthropic  # Import the official Anthropic SDK
 
 from tools import ComputerTool, BashTool, EditTool, BrowserTool, SearchTool, DockerTool
 
 # Configure logging
 logger = logging.getLogger("agent-loop")
+
+class SimpleAnthropicClient:
+    """
+    A very simple Anthropic API client that doesn't rely on the SDK.
+    This avoids version compatibility issues.
+    """
+    
+    def __init__(self, api_key):
+        self.api_key = api_key
+        self.base_url = "https://api.anthropic.com/v1/messages"
+        self.headers = {
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json"
+        }
+    
+    def create_message(self, model, messages, tools=None, max_tokens=4096, beta=None):
+        """Send a request to the Anthropic API."""
+        payload = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": max_tokens
+        }
+        
+        # Add tools if provided
+        if tools:
+            payload["tools"] = tools
+        
+        # Add beta flags if provided
+        if beta:
+            self.headers["anthropic-beta"] = beta if isinstance(beta, str) else ",".join(beta)
+        
+        logger.debug(f"Sending API request to {self.base_url}")
+        
+        try:
+            response = requests.post(
+                self.base_url,
+                headers=self.headers,
+                json=payload
+            )
+            
+            # Check for errors
+            if response.status_code != 200:
+                logger.error(f"API error: {response.status_code} - {response.text}")
+                error_msg = f"API request failed with status {response.status_code}: {response.text}"
+                raise Exception(error_msg)
+            
+            # Parse the response
+            data = response.json()
+            logger.debug("API request successful")
+            
+            # Return a simple response object
+            return SimpleResponse(data)
+        except requests.RequestException as e:
+            logger.error(f"Request error: {e}")
+            raise Exception(f"API request failed: {e}")
+
+class SimpleResponse:
+    """A simple response object that mimics the Anthropic SDK response."""
+    
+    def __init__(self, data):
+        self.id = data.get("id")
+        self.model = data.get("model")
+        self.content = []
+        self.tool_calls = []
+        
+        # Parse response content
+        content_data = data.get("content", [])
+        for block in content_data:
+            block_type = block.get("type")
+            
+            if block_type == "text":
+                self.content.append(SimpleTextBlock(block))
+            elif block_type == "tool_use":
+                tool_call = SimpleToolCall(block)
+                self.content.append(tool_call)
+                self.tool_calls.append(tool_call)
+        
+        # Extract usage information
+        usage_data = data.get("usage", {})
+        self.usage = SimpleUsage(usage_data)
+
+class SimpleTextBlock:
+    """A simple text block object."""
+    
+    def __init__(self, data):
+        self.type = "text"
+        self.text = data.get("text", "")
+
+class SimpleToolCall:
+    """A simple tool call object."""
+    
+    def __init__(self, data):
+        self.type = "tool_use"
+        self.id = data.get("id", "")
+        self.name = data.get("name", "")
+        self.input = data.get("input", {})
+
+class SimpleUsage:
+    """A simple usage information object."""
+    
+    def __init__(self, data):
+        self.input_tokens = data.get("input_tokens", 0)
+        self.output_tokens = data.get("output_tokens", 0)
 
 class AgentLoop:
     """
@@ -183,13 +290,13 @@ class AgentLoop:
             logger.error(f"Error saving tool output: {e}")
             logger.error(traceback.format_exc())
     
-    def add_message(self, role: str, content: str) -> None:
+    def add_message(self, role: str, content: Any) -> None:
         """
         Add a message to the conversation history.
         
         Args:
             role: Role of the message (user or assistant)
-            content: Content of the message
+            content: Content of the message (string or list of content blocks)
         """
         self.conversation_history.append({"role": role, "content": content})
         logger.debug(f"Added {role} message to conversation history")
@@ -281,7 +388,7 @@ class AgentLoop:
         """
         return self.tools["api_tools"]
     
-    def run(self, user_input: str) -> Dict[str, Any]:
+    def run(self, user_input: str) -> Tuple[str, List[Dict[str, Any]]]:
         """
         Run the agent loop with the given user input.
         
@@ -291,137 +398,37 @@ class AgentLoop:
         Returns:
             Tuple of (assistant_message, tool_calls)
         """
-        # Custom Anthropic client wrapper to avoid proxy issues
-        # We'll directly use the requests library to make API calls
-        import requests
-        import json
-        
-        class SimpleAnthropicClient:
-            """
-            Simple client for Anthropic API that avoids proxy issues
-            """
-            def __init__(self, api_key):
-                self.api_key = api_key
-                self.base_url = "https://api.anthropic.com"
-                self.headers = {
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                    "x-api-key": api_key
-                }
-                # Create beta namespace
-                self.beta = SimpleAnthropicBeta(self)
-                
-            def messages_create(self, **kwargs):
-                """Call the messages API"""
-                url = f"{self.base_url}/v1/messages"
-                logger.info(f"Making API request to: {url}")
-                response = requests.post(url, headers=self.headers, json=kwargs)
-                
-                if response.status_code != 200:
-                    logger.error(f"API error: {response.status_code} - {response.text}")
-                    raise Exception(f"API error: {response.status_code} - {response.text}")
-                
-                # Convert to SimpleResponse object
-                data = response.json()
-                return SimpleResponse(data)
-        
-        class SimpleAnthropicBeta:
-            """Beta namespace for SimpleAnthropicClient"""
-            def __init__(self, client):
-                self.client = client
-                # Create messages namespace with create method
-                self.messages = SimpleMessages(self.client)
-                
-            def messages_create(self, **kwargs):
-                """Call the beta messages API - legacy method for backward compatibility"""
-                # Add beta flags to headers
-                if "betas" in kwargs:
-                    self.client.headers["anthropic-beta"] = ",".join(kwargs.pop("betas"))
-                
-                return self.client.messages_create(**kwargs)
-        
-        class SimpleMessages:
-            """Messages namespace for SimpleAnthropicClient"""
-            def __init__(self, client):
-                self.client = client
-                
-            def create(self, **kwargs):
-                """Create a message - matches the structure of the official SDK"""
-                # Add beta flags to headers if present
-                if "betas" in kwargs:
-                    self.client.headers["anthropic-beta"] = ",".join(kwargs.pop("betas"))
-                    
-                # Call the client's messages_create method
-                return self.client.messages_create(**kwargs)
-        
-        class SimpleResponse:
-            """Wrapper for API response to mimic Anthropic client response"""
-            def __init__(self, data):
-                self.id = data.get("id")
-                self.model = data.get("model")
-                self.usage = SimpleUsage(data.get("usage", {}))
-                self.content = data.get("content", [])
-                # Extract tool calls if present
-                self.tool_calls = []
-                for block in self.content:
-                    if block.get("type") == "tool_use":
-                        self.tool_calls.append(SimpleToolCall(block))
-                        
-        class SimpleUsage:
-            """Usage information wrapper"""
-            def __init__(self, data):
-                self.input_tokens = data.get("input_tokens", 0)
-                self.output_tokens = data.get("output_tokens", 0)
-                
-        class SimpleToolCall:
-            """Tool call wrapper"""
-            def __init__(self, data):
-                self.id = data.get("id")
-                self.name = data.get("name")
-                self.input = data.get("input", {})
-                self.type = data.get("type")
-                
         # Add user message to conversation history
         self.add_message("user", user_input)
         logger.info("Processing user input")
         
-        # Initialize our simplified Anthropic client
-        logger.info("Initializing simple Anthropic client")
+        # Initialize our custom Anthropic client
         try:
             client = SimpleAnthropicClient(api_key=self.api_key)
-            logger.debug("Simple Anthropic client initialized successfully")
+            logger.debug("Initialized custom Anthropic client")
         except Exception as e:
             self.stats["errors"]["api"] += 1
-            logger.error(f"Failed to initialize simple Anthropic client: {e}")
+            logger.error(f"Failed to initialize custom Anthropic client: {e}")
             logger.error(traceback.format_exc())
             raise
         
-        # Create the request parameters
-        request = {
-            "model": self.model,
-            "messages": self.conversation_history,
-            "tools": self.get_api_tools(),
-            "max_tokens": 4096,
-            "betas": [self.beta_flag]
-        }
-        
-        # Log the request for debugging
-        logger.info(f"Sending request to Claude API with model={self.model}")
-        logger.debug(f"Request contains {len(self.conversation_history)} messages and {len(self.get_api_tools())} tools")
-        
-        # Update request stats
-        self.stats["total_requests"] += 1
-        
-        # Send the request
+        # Send the request with retry logic
         response = None
         request_start_time = time.time()
+        
         for attempt in range(self.max_retries):
             try:
                 logger.info(f"API call attempt {attempt+1}/{self.max_retries}")
                 start_time = time.time()
                 
-                # Use the .beta namespace for the latest API pattern
-                response = client.beta.messages.create(**request)
+                # Make the API call
+                response = client.create_message(
+                    model=self.model,
+                    messages=self.conversation_history,
+                    tools=self.get_api_tools(),
+                    max_tokens=4096,
+                    beta=self.beta_flag
+                )
                 
                 elapsed = time.time() - start_time
                 self.stats["total_api_time"] += elapsed
@@ -430,23 +437,6 @@ class AgentLoop:
             except Exception as e:
                 self.stats["errors"]["api"] += 1
                 logger.error(f"API call failed (attempt {attempt+1}/{self.max_retries}): {e}")
-                
-                # Try alternative approach without beta namespace if that failed
-                if "beta" in str(e) and attempt == 0:
-                    logger.info("Trying alternative approach without beta namespace")
-                    try:
-                        alt_request = request.copy()
-                        # Remove betas parameter for compatibility
-                        if "betas" in alt_request:
-                            del alt_request["betas"]
-                        
-                        response = client.messages.create(**alt_request)
-                        elapsed = time.time() - start_time
-                        self.stats["total_api_time"] += elapsed
-                        logger.info(f"Alternative API call succeeded in {elapsed:.2f} seconds")
-                        break
-                    except Exception as alt_e:
-                        logger.error(f"Alternative approach also failed: {alt_e}")
                 
                 if attempt < self.max_retries - 1:
                     retry_time = self.retry_delay * (attempt + 1)
@@ -465,109 +455,20 @@ class AgentLoop:
         
         # Process the response
         try:
-            # Extract message text - handle both newer and older response formats
+            # Extract assistant message from content blocks
             assistant_message = ""
-            if hasattr(response, 'content') and isinstance(response.content, list):
-                # Newer format with content blocks
-                for block in response.content:
-                    if hasattr(block, 'type') and block.type == 'text':
-                        assistant_message = block.text
-                        break
-            elif hasattr(response, 'content') and isinstance(response.content, str):
-                # Older format with content as string
-                assistant_message = response.content
-            else:
-                # Fallback to content[0].text if available
-                try:
-                    assistant_message = response.content[0].text
-                except (AttributeError, IndexError, TypeError):
-                    logger.warning("Could not extract assistant message using standard methods")
-                    assistant_message = str(response)
-            
-            logger.info("Successfully extracted assistant message from response")
-            logger.debug(f"Assistant message length: {len(assistant_message)} characters")
-            
-            # Process tool calls - handle both newer and older formats
             tool_calls = []
             
-            # Try newer format first (tool_use blocks)
-            if hasattr(response, 'content') and isinstance(response.content, list):
-                found_tool_uses = False
-                for block in response.content:
-                    if hasattr(block, 'type') and block.type == 'tool_use':
-                        found_tool_uses = True
-                        tool_name = block.name
-                        tool_args = block.input
-                        tool_id = block.id
-                        
-                        logger.info(f"Processing tool call: {tool_name} (ID: {tool_id})")
-                        logger.debug(f"Tool arguments: {tool_args}")
-                        
-                        # Find the tool
-                        tool = self.tools["instances"].get(tool_name)
-                        if not tool:
-                            logger.warning(f"Unknown tool: {tool_name}")
-                            continue
-                        
-                        # Execute the tool
-                        start_time = time.time()
-                        success = True
-                        error_msg = None
-                        
-                        try:
-                            result = tool.run(tool_args)
-                        except Exception as e:
-                            success = False
-                            error_msg = str(e)
-                            result = {"success": False, "message": str(e)}
-                            logger.error(f"Error executing tool {tool_name}: {e}")
-                            logger.error(traceback.format_exc())
-                        
-                        duration = time.time() - start_time
-                        
-                        # Log tool usage
-                        self.log_tool_usage(
-                            tool_name=tool_name,
-                            args=tool_args,
-                            result=result,
-                            duration=duration,
-                            success=success,
-                            error=error_msg
-                        )
-                        
-                        # Format in the new expected format
-                        tool_calls.append({
-                            "name": tool_name,
-                            "args": tool_args,
-                            "result": result,
-                            "tool_use_id": tool_id
-                        })
-                        
-                        logger.info(f"Tool {tool_name} executed in {duration:.2f}s (success={success})")
-                
-                # If we found and processed tool_use blocks, add them to the conversation
-                if found_tool_uses and tool_calls:
-                    # Format the tool results as expected by the API
-                    tool_results = []
-                    for call in tool_calls:
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": call["tool_use_id"],
-                            "content": call["result"]
-                        })
+            # Process the response content blocks
+            for content_block in response.content:
+                if content_block.type == "text":
+                    assistant_message = content_block.text
+                elif content_block.type == "tool_use":
+                    tool_name = content_block.name
+                    tool_args = content_block.input
+                    tool_id = content_block.id
                     
-                    # Add tool results to conversation history
-                    self.add_message("user", tool_results)
-            
-            # Fall back to older format if no tool_use blocks found
-            elif hasattr(response, 'tool_calls') and response.tool_calls:
-                logger.info(f"Using legacy format: Found {len(response.tool_calls)} tool calls in response")
-                
-                for call in response.tool_calls:
-                    tool_name = call.name
-                    tool_args = call.input
-                    
-                    logger.info(f"Processing tool call: {tool_name}")
+                    logger.info(f"Processing tool call: {tool_name} (ID: {tool_id})")
                     logger.debug(f"Tool arguments: {tool_args}")
                     
                     # Find the tool
@@ -582,7 +483,7 @@ class AgentLoop:
                     error_msg = None
                     
                     try:
-                        result = tool.run(tool_args)
+                        result = tool.run(**tool_args)
                     except Exception as e:
                         success = False
                         error_msg = str(e)
@@ -606,27 +507,33 @@ class AgentLoop:
                     tool_calls.append({
                         "name": tool_name,
                         "args": tool_args,
-                        "result": result
+                        "result": result,
+                        "tool_use_id": tool_id
                     })
                     
                     logger.info(f"Tool {tool_name} executed in {duration:.2f}s (success={success})")
-            else:
-                logger.info("No tool calls found in response")
+                    
+                    # Add tool result to conversation for Claude to see
+                    tool_results = [{
+                        "type": "tool_result",
+                        "tool_use_id": tool_id,
+                        "content": result
+                    }]
+                    
+                    self.add_message("user", tool_results)
             
-            # Update token stats
-            if hasattr(response, 'usage') and response.usage:
-                if hasattr(response.usage, 'input_tokens'):
-                    logger.debug(f"Input tokens: {response.usage.input_tokens}")
-                    self.stats["total_tokens"] += response.usage.input_tokens
-                if hasattr(response.usage, 'output_tokens'):
-                    logger.debug(f"Output tokens: {response.usage.output_tokens}")
-                    self.stats["total_tokens"] += response.usage.output_tokens
+            # Update token stats if available
+            if hasattr(response, 'usage'):
+                input_tokens = getattr(response.usage, 'input_tokens', 0)
+                output_tokens = getattr(response.usage, 'output_tokens', 0)
+                self.stats["total_tokens"] += input_tokens + output_tokens
+                logger.debug(f"Total tokens: {input_tokens + output_tokens}")
             
             # Log response time
             logger.info(f"Total request+processing time: {total_request_time:.2f}s")
         except Exception as e:
             self.stats["errors"]["other"] += 1
-            logger.error(f"Failed to extract assistant message from response: {e}")
+            logger.error(f"Failed to process response: {e}")
             logger.error(traceback.format_exc())
             raise
         
@@ -636,7 +543,7 @@ class AgentLoop:
         # Save stats
         self._save_stats()
         
-        # Return assistant message and tool calls for Streamlit compatibility
+        # Return assistant message and tool calls
         return assistant_message, tool_calls
     
     def _save_stats(self) -> None:
@@ -651,4 +558,4 @@ class AgentLoop:
             logger.debug("Saved agent stats")
         except Exception as e:
             logger.error(f"Error saving agent stats: {e}")
-            logger.error(traceback.format_exc()) 
+            logger.error(traceback.format_exc())

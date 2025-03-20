@@ -1,0 +1,23 @@
+version: '3'
+
+services:
+  claude-demo:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "${PORT:-8501}:8501"
+    volumes:
+      - ./workspace:/app/workspace
+      - ./data:/app/data
+      # Docker socket - uncomment the appropriate one for your OS
+      # For Linux/Mac:
+      #- /var/run/docker.sock:/var/run/docker.sock
+      # For Windows:
+      #- //./pipe/docker_engine://./pipe/docker_engine
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - MODEL=${MODEL:-claude-3-5-sonnet-20241022}
+      - BETA_FLAG=${BETA_FLAG:-computer-use-2024-10-22}
+      - PYTHONUNBUFFERED=1
+    command: python /app/container_entry.py
